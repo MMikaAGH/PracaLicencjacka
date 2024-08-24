@@ -1,0 +1,1278 @@
+---
+title: "Przewidywanie ME metodą Random Forest"
+author: "Marcin Mika"
+date: "2024-05-05"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+# 1. Potrzebne biblioteki
+
+```{r setup, warning=FALSE, message=FALSE}
+library(rstudioapi)
+library(fitdistrplus)
+library(dplyr)
+library(randomForest)
+library(ggplot2)
+library(cowplot)
+library(corrplot)
+library(keras)
+```
+
+# 2. Funkcje
+```{r}
+# FUNKCJA DO OBLICZANIA RÓŻNICY BRAMEK
+calculate_goals_diff <- function(group_results, col_name) {
+  unique_gameIds <- unique(group_results$gameId)
+  goals_diff <- c()
+  for (game_id in unique_gameIds) {
+    goals_game <- group_results[group_results$gameId == game_id, col_name]
+    diff <- round(goals_game[1]) - round(goals_game[2])
+    goals_diff <- c(goals_diff, diff, -diff)
+  }
+  return(goals_diff)
+}
+
+# FUNCJA DO GENEROWANIA DANYCH DO NASTEPNEJ FAZY
+generate_match_data <- function(match_pairs, playoffs, data, starting_id, df_name) {
+  df <- data.frame()
+  
+  for (pair in match_pairs) {
+    team_A1 <- playoffs %>%
+      filter(group_and_position == pair[1]) %>%
+      select(team)
+    
+    opponent_C2 <- playoffs %>%
+      filter(group_and_position == pair[2]) %>%
+      select(team) %>%
+      rename(opponent = team)
+    temp <- team_A1
+    pair_data <- cross_join(team_A1, opponent_C2) %>%
+      mutate(
+        gameId = starting_id,
+        #phase = paste(playoffs[playoffs$team == team, "group_and_position"], playoffs[playoffs$team == opponent, "group_and_position"]),
+        year = 2024,
+        goals = NA,
+        home = data[team == data$team, "home"],
+        fifaRankDiff = data[team == data$team, "rank_aprill"] - data[opponent == data$team, "rank_aprill"],
+        avgTvDiff = data[team == data$team, "avg_team_value"] - data[opponent == data$team, "avg_team_value"],
+      
+        avgAgeDiff = data[team == data$team, "Avg_age"] - data[opponent == data$team, "Avg_age"],
+        gdpPcDiff = data[team == data$team, "GDP_pc_year_bf_euro"] - data[opponent == data$team, "GDP_pc_year_bf_euro"],
+                playersAbroadDiff = data[team == data$team, "players_abroad"] - data[opponent == data$team, "players_abroad"],
+        coachFromCountry = data[team == data$team, "coach_from_country"],
+        topTenClubsDiff = data[team == data$team, "top_10clubs_players"] - data[opponent == data$team, "top_10clubs_players"]
+      )
+    pair_data <- bind_rows(
+      pair_data,
+      cross_join(opponent_C2, team_A1) %>%
+        mutate(
+          gameId = starting_id,
+          #phase = paste(playoffs[playoffs$team == team, "group_and_position"], playoffs[playoffs$team == opponent, "group_and_position"]),
+          year = 2024,
+          year = 2024,
+          goals = NA,
+          home = data[opponent == data$team, "home"],
+          fifaRankDiff = -(data[team == data$team, "rank_aprill"] - data[opponent == data$team, "rank_aprill"]),
+          avgTvDiff = -(data[team == data$team, "avg_team_value"] - data[opponent == data$team, "avg_team_value"]),
+          avgAgeDiff = -(data[team == data$team, "Avg_age"] - data[opponent == data$team, "Avg_age"]),
+          gdpPcDiff = -(data[team == data$team, "GDP_pc_year_bf_euro"] - data[opponent == data$team, "GDP_pc_year_bf_euro"]),
+                    playersAbroadDiff = -(data[team == data$team, "players_abroad"] - data[opponent == data$team, "players_abroad"]),
+          coachFromCountry = data[opponent == data$team, "coach_from_country"],
+          topTenClubsDiff = -(data[team == data$team, "top_10clubs_players"] - data[opponent == data$team, "top_10clubs_players"])
+        ) %>%
+        mutate(
+          team = opponent,
+          opponent = as.character(temp$team)
+        )
+    )
+    starting_id =  starting_id + 1
+    df <- bind_rows(df, pair_data)
+  }
+  assign(df_name, df, envir = .GlobalEnv)
+}
+
+# FUNKCJA DO SORTOWANIA GRUPY PO ODPOWIEDNICH WARTOŚCIACH
+sort_group_summary <- function(df) {
+  if (any(grepl("^total_direct", names(df)))) {
+    df <- df %>%
+      arrange(desc(total_points),
+              desc(total_direct_matches_points),
+              desc(total_direct_matches_goals_diff),
+              desc(total_direct_matches_goals_scored),
+              desc(total_goalsDiff),
+              desc(total_goalsScored),
+              ranking)
+  } 
+  else if (any(grepl("^direct_match", names(df)))) {
+    direct_match_points <- names(df)[grepl("^direct_match_points", names(df))][1]
+    direct_match_goals_diff <- names(df)[grepl("^direct_match_goals_diff", names(df))][1]
+    direct_match_goals_scored <- names(df)[grepl("^direct_match_goals_scored", names(df))][1]
+    
+    df <- df %>%
+      arrange(desc(total_points),
+              desc(!!sym(direct_match_points)),
+              desc(!!sym(direct_match_goals_diff)),
+              desc(!!sym(direct_match_goals_scored)),
+              desc(total_goalsDiff),
+              desc(total_goalsScored),
+              ranking)
+  } 
+  else {
+    df <- df %>%
+      arrange(desc(total_points),
+              desc(total_goalsDiff),
+              desc(total_goalsScored),
+              ranking)
+  }
+  
+  return(df)
+}
+
+# FUNKCJA DO USTAWIANIA 1/8
+valid_match <- function(team1, team2, team3, team4, group_and_position) {
+  return(all(
+    c(team1, team2, team3, team4) %in% group_and_position
+  ))
+}
+
+# FUNKCJA DO USTAWIANIA 1/8
+check_values <- function(x) all(x %in% playoffs$group_and_position)
+
+# FUNKCJA DO WYBIERANIA DRUŻYN KTÓRE PRZECHODZA DALEJ
+select_teams <- function(playoffs8_result, result_df_name) {
+  selected_teams <- c()
+  selected_gaps <- c()
+  
+  for (game_id in unique(playoffs8_result$gameId)) {
+    game_data <- playoffs8_result[playoffs8_result$gameId == game_id, ]
+    if (nrow(game_data) == 2) {
+      goals_diff <- game_data$goalsDiff
+      goals_diff2 <- game_data$diff_overtime
+      if (goals_diff[1] > goals_diff[2]) {
+        selected_team <- game_data$team[1]
+        selected_gap <- game_data$gameId[1]
+      } else if (goals_diff[1] < goals_diff[2]) {
+        selected_team <- game_data$team[2]
+        selected_gap <- game_data$gameId[2]
+      } else if (goals_diff[1] == goals_diff[2] && goals_diff2[1] > goals_diff2[2]) {
+        selected_team <- game_data$team[1]
+        selected_gap <- game_data$gameId[1]
+      } else if (goals_diff[1] == goals_diff[2] && goals_diff2[1] < goals_diff2[2]) {
+        selected_team <- game_data$team[2]
+        selected_gap <- game_data$gameId[2]
+      } else {
+        selected_index <- sample(1:2, 1)
+        selected_team <- game_data$team[selected_index]
+        selected_gap <- game_data$gameId[selected_index]
+      }
+      selected_teams <- c(selected_teams, selected_team)
+      selected_gaps <- c(selected_gaps, selected_gap)
+    }
+  }
+  result_df <- data.frame(team = selected_teams, group_and_position = selected_gaps)
+  assign(result_df_name, result_df, envir = .GlobalEnv)
+}
+
+# Funkcja do zliczania reprezentacji w każdej fazie:
+count_occurrences <- function(teams, counts_df) {
+  for (team in teams) {
+    counts_df$count[counts_df$team == team] <- counts_df$count[counts_df$team == team] + 1
+  }
+  return(counts_df)
+}
+```
+
+# 3. Dane
+```{r, warning=FALSE, message=FALSE}
+#setwd(dirname(getActiveDocumentContext()$path))
+data <- read.csv2("data.csv", sep =",")
+data2 <- read.csv2("data2.csv", sep =",")
+nations_league_rank <-read.csv2("nations_league_rank.csv", sep=",")
+playoffs_rules <- read.csv2("playoffs_rules.csv", sep=",")
+
+
+data2$goals <- as.numeric(data2$goals)
+data$team_value.mln.euro. <- as.numeric(data$team_value.mln.euro.)
+data$avg_team_value <- as.numeric(data$avg_team_value)
+data$GDP_pc_year_bf_euro <- as.numeric(data$GDP_pc_year_bf_euro)
+data$Avg_age <- as.numeric(data$Avg_age)
+data2$avgTvDiff <- as.numeric(data2$avgTvDiff)
+data2$gdpPcDiff <- as.numeric(data2$gdpPcDiff)
+data2$avgAgeDiff <- as.numeric(data2$avgAgeDiff)
+data2$valueDiff <- as.numeric(data2$valueDiff)
+data2$home <- as.factor(data2$home)
+data2$coachFromCountry <- as.factor(data2$coachFromCountry)
+data2 <- data2[, -10]
+```
+
+### data2:
+
+W data2 znajduja się wyniki wszytskich meczów z turniejów mistrzostw Europy w XXI wieku oraz mecze grupowe które będę przewidywał. <br>
+Zmienne: <br>
+- phase - informuje o fazie turnieju, jest używana tylko przy obserwacjach, których wyniki będę przewidywał. <br>
+- gameId - informuje o id spotkania w zbiorze. <br>
+- goals - liczba bramek zdobytych przez drużynę w meczu <br>
+- year - rok, w którym dane spotkanie się odbyło <br>
+- team - drużyna, dla której prezentuje zdobytą liczbę bramek w meczu. <br>
+- opponent - rywal drużyny ze zmiennej team <br>
+- home - informacja, czy dana drużyna rozegrała mecz w swoim państwie (0 - nie, 1 - tak)<br>
+- fifaRankDiff - różnica miedzy drużynami z team i opponent w rankingu FIFA (stan na kwiecien przed każdym turniejem) <br>
+źródło: <link> https://www.kaggle.com/datasets/cashncarry/fifaworldranking </link><br>
+- avgTvDiff - różnica miedzy drużynami z team i opponent w średniej wartości rynkowej jednego zawodnika (dane z 2024 pochodza z kwietnia, inne lata z turnieju). <br>
+źródło: <link> https://www.transfermarkt.com </link><br>
+- avgAgeDiff - różnica miedzy drużynami z team i opponent w średniej wartości wieku piłkarza (dane z 2024 pochodza z kwietnia, inne lata z turnieju). <br>
+źródło: <link> https://www.transfermarkt.com </link><br>
+- gdpPcDiff - różnica w PKB per capita (dolary 2015). Kraje z Wysp Brytyjskich maja tą samą wartość (nie mogłem znaleźć danych dla Aglii, Szkocji, Walii i Irlandii Północnej). <br>
+źródło: https://databank.worldbank.org/source/world-development-indicators <br>
+- playersAbroadDiff - różnica miedzy drużynami z team i opponent w ilości zawodników grających w klubach za granicą (dane z 2024 pochodza z ostatnich meczy reprezentacji w marcu, inne lata z turnieju). <br>
+źródło: <link> https://en.wikipedia.org/wiki/Main_Page  </link> <br>
+- coachFromCountry - informuje o tym, czy trener reprezentacji pochodzi z tego samego kraju <br>
+źródlo: <link> https://en.wikipedia.org/wiki/Main_Page  </link> <br>
+- toptenClubsDiff - różnica w ilości zawodników z najlepszych 10 klubów w Europie wg rankingu UEFA <br>
+źródło: <link> https://kassiesa.net/uefa/data/method5/trank2024.html <link> <br>
+        <link> https://en.wikipedia.org/wiki/Main_Page  </link>
+```{r}
+data2
+```
+
+### data:
+
+Znajduja się tu dane potrzebne do obliczenia zmiennych dla meczów w 1/8, 1/4, 1/2 i finału. Źródła dla danych są adekwatne do tych z data2.
+```{r}
+data
+```
+
+###  nations_league_rank:
+
+O kolejności drużyn w grupie decydują: <br>
+a. większa liczba punktów uzyskanych w meczach rozegranych między zainteresowanymi drużynami; <br>
+b. lepsza różnica bramek wynikająca z meczów rozegranych między zainteresowanymi drużynami; <br>
+c. większa liczba bramek zdobytych w meczach rozegranych między zainteresowanymi drużynami; <br>
+d. jeśli po zastosowaniu kryteriów a) do c) drużyny nadal mają równą liczbę punktów, kryteria a) do c) są ponownie stosowane wyłącznie do meczów między pozostałymi drużynami, aby określić ich końcową pozycję. Jeśli ta procedura nie prowadzi do rozstrzygnięcia, stosuje się kryteria e) do h) w podanej kolejności do dwóch lub więcej drużyn nadal równych: <br>
+e. lepsza różnica bramek we wszystkich meczach grupowych; <br>
+f. większa liczba bramek zdobytych we wszystkich meczach grupowych; <br>
+g. mniejsza liczba punktów dyscyplinarnych opartych wyłącznie na żółtych i czerwonych kartkach otrzymanych przez zawodników i członków zespołów we wszystkich meczach grupowych (czerwona kartka = 3 punkty, żółta kartka = 1 punkt, wykluczenie za dwie żółte kartki w jednym meczu = 3 punkty); <br>
+h. pozycja w ogólnym rankingu kwalifikacji europejskich lub jeśli Niemcy, drużyna gospodarza, są zaangażowane w porównanie, losowanie. <br> <br>
+
+Nie jestem w stanie przewidziec sytuacji w punkcie g, więc po nierozstrzygnieciu pozycji w grupie przy punkcie f, przechodzę do h - w tej tabeli znajduje się właśnie ten ranking. <br>
+(źródło: <link>https://documents.uefa.com/r/Regulations-of-the-UEFA-European-Football-Championship-2022-24/Article-20-Equality-of-points-final-tournament-group-stage-Online </link>)
+```{r}
+nations_league_rank
+```
+
+### playoffs_rules:
+
+Z kazdej grupy wychodza 2 najlepsze druzyny. Dodatkowo 4 najlepsze drużyny z trzecich miejsc. Mecze po wyjściu z grupy są zależne od tego, które reprezecntacje awansowały. Zasady układfania spotkań są przedstawione poniżej (źródło: <link>https://documents.uefa.com/r/Regulations-of-the-UEFA-European-Football-Championship-2022-24/Article-21-Match-system-final-tournament-knockout-stage-Online </link>)
+```{r}
+playoffs_rules
+```
+
+# 4. Macierz korelacji zmiennych liczbowych
+
+```{r}
+
+data2_clean <- na.omit(data2)
+selected_columns <- data2_clean[, c(8:12,14)]
+correlation_matrix <- cor(selected_columns, use = "complete.obs")
+corrplot(correlation_matrix, method = "circle")
+
+```
+<br> Można zauważyć, że zmienne dotyczące różnicy średniej wartości zespołu i różnicy ilości zawodników z 10 najlepszych klubów są wysoko dodatnio skorelowane. 
+
+# 5. Podział na zbiór treningowy i testowy  metoda bootstrap oraz oddzielenie danych do przewidzenia
+
+```{r}
+data2[, c(8:12, 14)] <- scale(data2[, c(8:12, 14)])
+data_predict <- data2[data2$year == 2024, ]
+data_training <- data2[data2$year != 2024, ]
+
+set.seed(40) 
+indeksy_bootstrap <- sample(nrow(data_training), replace = TRUE)
+data_training <- data_training[indeksy_bootstrap, ]
+data_test<- data_training[-indeksy_bootstrap, ]
+```
+Zbiór treningowy liczy 390 obserwacji. Dane sa po standaryzacji <br>
+```{r}
+data_training
+```
+Zbiór testowy liczy 149 obserwacji (są to obserwacje nie użyte w zbiorze treningowym)
+```{r}
+data_test
+```
+Dane do przewidzenia skladaja sie na ten moment tylko z meczy grupowych
+```{r}
+data_predict
+```
+# 6. Wybór modelu Random Forest
+Wybiore najlepszy model (z najmniejszym MSE na zbiorze testowym) z powstalych przez zmiane trzech parametrów: <br>
+- ntree (liczba drzew): <br>
+Opis: ntree określa liczbę drzew decyzyjnych w lesie. Większa liczba drzew zwykle poprawia stabilność i dokładność modelu, ponieważ zmniejsza wariancję wyników. Jednakże, większa liczba drzew zwiększa również czas obliczeń. <br>
+Przykłady wartości: 200, 500, 1000. <br>
+- mtry (liczba zmiennych losowo wybranych do podziału w węźle):<br>
+Opis: mtry to liczba zmiennych (cech), które są losowo wybierane na każdym podziale węzła drzewa. Wartość ta jest kluczowa, ponieważ wpływa na różnorodność i niezależność drzew w lesie. W praktyce, dla klasyfikacji często używa się wartości sqrt(p), a dla regresji p/3, gdzie p to liczba cech w danych.W moim przypadku to 8/3 czyli najlepsza powinna byc wartość 2 lub 3.<br>
+Przykłady wartości: 2, 3, 6.<br>
+- nodesize (minimalna liczba próbek na liść): <br>
+Opis: nodesize określa minimalną liczbę próbek wymaganą do utworzenia liścia (końcowego węzła). Większe wartości mogą prowadzić do bardziej ogólnych (mniej dopasowanych) modeli, podczas gdy mniejsze wartości mogą prowadzić do bardziej szczegółowych (przeuczonych) modeli. <br>
+Przykłady wartości: 5, 20, 100. <br>. 
+Zmienna objasniania: goals <br>
+Zmienne objaśniające: home, fifaRankDiff, avgTvDiff, avgAgeDiff, gdpPcDiff, playersAbroadDiff, coachFromCountry, topTenClubsDiff <br>
+
+```{r}
+ntree_values <- c(200, 500, 1000)
+mtry_values <- c(2, 3, 6)
+nodesize_values <- c(5, 20, 100)
+
+results <- data.frame(ntree = integer(), mtry = integer(), nodesize = integer(), 
+                      train_mse = numeric(), test_mse = numeric())
+
+best_test_mse <- Inf  
+my_forest <- NULL 
+best_pr <- NULL
+
+for (ntree in ntree_values) {
+  for (mtry in mtry_values) {
+    for (nodesize in nodesize_values) {
+      model <- randomForest(data_training$goals~ ., data = data_training[,7:14], ntree = ntree, mtry = mtry, nodesize = nodesize)
+      
+      train_predictions <- model$predicted
+      train_mse <- mean((data_training$goals - train_predictions)^2)
+      
+      test_predictions_model <- predict(model, newdata = data_test[,7:14])
+      test_predictions <- test_predictions_model
+      test_mse <- mean((data_test$goals - test_predictions)^2)
+      
+      results <- rbind(results, data.frame(ntree = ntree, mtry = mtry, nodesize = nodesize, 
+                                           train_mse = train_mse,  test_mse = test_mse))
+      
+      if (test_mse < best_test_mse) {
+        best_test_mse <- test_mse
+        my_forest <- model
+        best_pr <- test_predictions_model
+      }
+    }
+  }
+}
+```
+Najleosze wyniki:
+```{r}
+selected_rows <- subset(results, test_mse < 0.1)
+selected_rows
+```
+Najlepszy model:
+```{r}
+best_model_params <- results[which.min(results$test_mse), ]
+best_model_params
+my_forest
+```
+
+Wykres:
+```{r}
+ggplot(results, aes(x = factor(ntree), y = test_mse, color = factor(ntree))) +
+  geom_boxplot() +
+  geom_point(aes(y = train_mse), position = position_jitter(width = 0.2), alpha = 0.6) +
+  labs(title = "Porównanie train_mse i test_mse dla różnych wartości liczby drzew",
+       x = "Ntree",
+       y = "MSE",
+       color = "Ntree") +
+  theme_minimal()
+
+# Wykres porównujący mtry
+ggplot(results, aes(x = factor(mtry), y = test_mse, color = factor(mtry))) +
+  geom_boxplot() +
+  geom_point(aes(y = train_mse), position = position_jitter(width = 0.2), alpha = 0.6) +
+  labs(title = "Porównanie train_mse i test_mse dla różnych wartości liczby zmiennych losowo wybranych do podziału w węźle",
+       x = "Mtry",
+       y = "MSE",
+       color = "Mtry") +
+  theme_minimal()
+
+# Wykres porównujący nodesize
+ggplot(results, aes(x = factor(nodesize), y = test_mse, color = factor(nodesize))) +
+  geom_boxplot() +
+  geom_point(aes(y = train_mse), position = position_jitter(width = 0.2), alpha = 0.6) +
+  labs(title = "Porównanie train_mse i test_mse dla różnych wartości rozmiaru liścia",
+       x = "Nodesize",
+       y = "MSE",
+       color = "Nodesize") +
+  theme_minimal()
+```
+
+# 7. Ważność zmiennych: 
+
+```{r}
+importance <- importance(my_forest)
+var_importance <- data.frame(Variable = row.names(importance), Importance = importance[, "IncNodePurity"])
+
+ggplot(var_importance, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  xlab("Zmienna") +
+  ylab("Ważność (Średni spadek MSE)") +
+  ggtitle("Wykres ważności zmiennych z modelu Random Forest") +
+  theme_minimal()
+```
+<br>Wygląda, że najważniejsze zmienne to te dotyczące różnicy państw w rankingu FIFA i różnicy w średniej wartości rynkowej zawodnika. Najmniej ważne to te informujące o tym czy mecz odbywał się na terenie państwa i czy trener pochodził z tego samego kraju co reprezentacja.
+
+# 8. RANDOM FOREST - wyniki
+
+Symulacje wykonałem 100 razy (przy rzutach karnych wyniki się zmieniają).
+
+```{r}
+teams_list <- unique(data$team)
+playoffs_counts <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+playoffs4_counts <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+playoffs2_counts <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+final_counts <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+winner_counts <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+n <- 100
+groups <- c("A", "B", "C", "D", "E", "F")
+predict_goals <- predict(my_forest, data_predict)
+data_predict$goals <- predict_goals
+playoffs <- data.frame(matrix(ncol = 6, nrow = 0))
+colnames(playoffs) <- c("team", "total_points", "total_goalsDiff", "total_goalsScored", "ranking", "group_and_position")  
+for (i in 1:n) {
+  for (group in groups) {
+    assign(paste0("group_", group, "_results"), data_predict[data_predict$phase == paste0("group", group), 2:6])
+    group_results <- get(paste0("group_", group, "_results"))
+    group_results$goals_scored <- round(group_results$goals)
+    group_results$goalsDiff <- calculate_goals_diff(group_results, "goals")
+    group_results$points <- ifelse(group_results$goalsDiff < 0, 0, 
+                                   ifelse(group_results$goalsDiff == 0, 1, 3))
+    assign(paste0("group_", group, "_results"), group_results)
+    group_summary <- aggregate(points ~ team, data = group_results, sum)
+    names(group_summary)[2] <- "total_points"
+    teams_same_points <- group_summary %>%
+      group_by(total_points) %>%
+      filter(n() > 1)
+    
+    if (all(teams_same_points$total_points == teams_same_points$total_points[1]) && nrow(teams_same_points) > 0) {
+      for (i in 1:(nrow(teams_same_points) - 1)) {
+        for (j in (i + 1):nrow(teams_same_points)) {
+          team1 <- teams_same_points$team[i]
+          team2 <- teams_same_points$team[j]
+          
+          direct_match <- group_results %>%
+            filter((team == team1 & opponent == team2) |
+                     (team == team2 & opponent == team1))
+          
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_points_", team1, "_vs_", team2) := 
+                     case_when(
+                       team == team1 ~ direct_match$points[1],
+                       team == team2 ~ direct_match$points[2],
+                       TRUE ~ NA_real_
+                     ))
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_goals_diff_", team1, "_vs_", team2) := 
+                     case_when(
+                       team == team1 ~ direct_match$goalsDiff[1],
+                       team == team2 ~ direct_match$goalsDiff[2],
+                       TRUE ~ NA_real_
+                     ))
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_goals_scored_", team1, "_vs_", team2) := 
+                     case_when(
+                       team == team1 ~ direct_match$goals_scored[1],
+                       team == team2 ~ direct_match$goals_scored[2],
+                       TRUE ~ NA_real_
+                     ))
+          
+        }
+      }
+      direct_match_points <- grep("^direct_match_points", names(group_summary), value = TRUE)
+      if (length(direct_match_points) > 1) {
+        group_summary$total_direct_matches_points <- rowSums(!is.na(group_summary[, direct_match_points]))
+      }
+      direct_match_goals_diff <- grep("^direct_match_goals_diff", names(group_summary), value = TRUE)
+      if (length(direct_match_goals_diff ) > 1) {
+        group_summary$total_direct_matches_goals_diff <- rowSums(!is.na(group_summary[, direct_match_goals_diff]))
+      }
+      direct_match_goals_scored <- grep("^direct_match_goals_scored", names(group_summary), value = TRUE)
+      if (length(direct_match_goals_scored) > 1) {
+        group_summary$total_direct_matches_goals_scored <- rowSums(!is.na(group_summary[, direct_match_goals_scored]))
+      }
+      
+    }else if(any(teams_same_points$total_points != teams_same_points$total_points[1]) && nrow(teams_same_points) > 0){
+      max_points_teams <- group_summary[group_summary$total_points == max(group_summary$total_points), "team"]
+      min_points_teams <- group_summary[group_summary$total_points == min(group_summary$total_points), "team"]
+      
+      for (i in 1:(length(max_points_teams) -1)) {
+        for (j in (i + 1):length(max_points_teams)) {
+          max_team1 <- max_points_teams[i]
+          max_team2 <- max_points_teams[j]
+          
+          direct_match <- group_results %>%
+            filter((team == max_team1 & opponent == max_team2) |
+                     (team == max_team2 & opponent == max_team1))
+          
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_points_", max_team1, "_vs_", max_team2) := 
+                     case_when(
+                       team == max_team1 ~ direct_match$points[1],
+                       team == max_team2 ~ direct_match$points[2],
+                       TRUE ~ NA_real_
+                     ))
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_goals_diff_", max_team1, "_vs_", max_team2) := 
+                     case_when(
+                       team == max_team1 ~ direct_match$goalsDiff[1],
+                       team == max_team2 ~ direct_match$goalsDiff[2],
+                       TRUE ~ NA_real_
+                     ))
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_goals_scored_", max_team1, "_vs_", max_team2) := 
+                     case_when(
+                       team == max_team1 ~ direct_match$goals_scored[1],
+                       team == max_team2 ~ direct_match$goals_scored[2],
+                       TRUE ~ NA_real_
+                     ))
+        }
+      }
+      for (i in 1:(length(min_points_teams) - 1)) {
+        for (j in (i + 1):length(min_points_teams)) {
+          min_team1 <- min_points_teams[i]
+          min_team2 <- min_points_teams[j]
+          
+          direct_match <- group_results %>%
+            filter((team == min_team1 & opponent == min_team2) |
+                     (team == min_team2 & opponent == min_team1))
+          
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_points_", min_team1, "_vs_", min_team2) := 
+                     case_when(
+                       team == min_team1 ~ direct_match$points[1],
+                       team == min_team2 ~ direct_match$points[2],
+                       TRUE ~ NA_real_
+                     ))
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_goals_diff_", min_team1, "_vs_", min_team2) := 
+                     case_when(
+                       team == min_team1 ~ direct_match$goalsDiff[1],
+                       team == min_team2 ~ direct_match$goalsDiff[2],
+                       TRUE ~ NA_real_
+                     ))
+          group_summary <- group_summary %>%
+            mutate(!!paste0("direct_match_goals_scored_", min_team1, "_vs_", min_team2) := 
+                     case_when(
+                       team == min_team1 ~ direct_match$goals_scored[1],
+                       team == min_team2 ~ direct_match$goals_scored[2],
+                       TRUE ~ NA_real_
+                     ))
+        }
+      }
+    }
+    sum_goalsDiff <- group_results %>%
+      group_by(team) %>%
+      summarise(total_goalsDiff = sum(goalsDiff, na.rm = TRUE))
+    
+    group_summary <- group_summary %>%
+      left_join(sum_goalsDiff, by = "team")
+    
+    sum_goalsScored <- group_results %>%
+      group_by(team) %>%
+      summarise(total_goalsScored = sum(goals_scored, na.rm = TRUE))
+    
+    group_summary <- group_summary %>%
+      left_join(sum_goalsScored, by = "team")
+    
+    group_summary <- left_join(group_summary, nations_league_rank, by = "team")
+    group_summary <- sort_group_summary(group_summary)
+    group_summary$group_and_position <- paste0(group, which(group_summary$team == group_summary$team), sep = "")
+    assign(paste0("group_", group, "_summary"), group_summary)
+    
+  }
+  
+  third_place_summary <- data.frame(team = character(), total_points = numeric(), stringsAsFactors = FALSE)
+  for (group in groups) {
+    third_place <- get(paste0("group_", group, "_summary"))[3, c("team", "total_points", "total_goalsDiff", "total_goalsScored", "ranking", "group_and_position")]
+    third_place_summary <- rbind(third_place_summary, third_place)
+  }
+  
+  third_place_summary<- arrange(third_place_summary, desc(total_points),desc(total_goalsDiff),desc(total_goalsScored),ranking)
+  
+  playoffs <- rbind(third_place_summary[1:4, ])
+  for (group in groups) {
+    group_summary <- get(paste0("group_", group, "_summary"))
+    playoffs <- rbind(playoffs, group_summary[1:2, c("team", "total_points", "total_goalsDiff", "total_goalsScored", "ranking", "group_and_position")])
+  }
+  
+  playoffs8 <- data.frame()
+  result <- playoffs_rules[apply(playoffs_rules[, 1:4], 1, check_values), ]
+  
+  match_pairs <- list(
+    c("A1", "C2", 37),
+    c("A2", "B2", 38),
+    c(colnames(result)[5], result$B1,39),
+    c(colnames(result)[6], result$C1,40),
+    c(colnames(result)[8], result$F1,41),
+    c("D2", "E2", 42),
+    c(colnames(result)[7], result$E1,43),
+    c("D1", "F2", 44)
+  )
+  
+  generate_match_data(match_pairs, playoffs, data, 37, df_name = "playoffs8")
+  playoffs8[, c(7:11, 13)] <- scale(playoffs8[, c(7:11, 13)])
+  playoffs8$avgTvDiff <- as.numeric(playoffs8$avgTvDiff)
+  playoffs8$gdpPcDiff <- as.numeric(playoffs8$gdpPcDiff)
+  playoffs8$avgAgeDiff <- as.numeric(playoffs8$avgAgeDiff)
+  playoffs8$home <- factor(playoffs8$home, levels = c("0", "1"))
+  playoffs8$coachFromCountry <- factor(playoffs8$coachFromCountry, levels = c("0", "1"))
+  
+  predict_goals_1_8 <- predict(my_forest, playoffs8[,6:13])
+  playoffs8$goals <- predict_goals_1_8
+  
+  playoffs8_result <-playoffs8[,1:6]
+  playoffs8_result$goals_scored <- round(playoffs8_result$goals)
+  playoffs8_result$goalsDiff <- calculate_goals_diff(playoffs8_result, "goals")
+  playoffs8_result$goals2 <- playoffs8_result$goals * 1.33
+  playoffs8_result$diff_overtime <- calculate_goals_diff(playoffs8_result, "goals2")
+  
+  
+  select_teams(playoffs8_result, "playoffs4")
+  match_pairs2 <- list(
+    c('39', '37', 45),
+    c('41', '42', 46),
+    c('40', '38', 47),
+    c('43', '44', 48)
+  )
+  generate_match_data(match_pairs2, playoffs4, data, 45, "playoffs4_matches" )
+  playoffs4_matches[, c(7:11, 13)] <- scale(playoffs4_matches[, c(7:11, 13)])
+  playoffs4_matches$home <- factor(playoffs4_matches$home, levels = c("0", "1"))
+  playoffs4_matches$coachFromCountry <- factor(playoffs4_matches$coachFromCountry, levels = c("0", "1"))
+  predict_goals4 <- predict(my_forest, playoffs4_matches[,6:13])
+  playoffs4_matches$goals <- predict_goals4
+  
+  playoffs4_result <-playoffs4_matches[,1:6]
+  playoffs4_result$goals_scored <- round(playoffs4_result$goals)
+  playoffs4_result$goalsDiff <- calculate_goals_diff(playoffs4_result, "goals")
+  playoffs4_result$goals2 <- playoffs4_result$goals * 1.33
+  playoffs4_result$diff_overtime <- calculate_goals_diff(playoffs4_result, "goals2")
+  select_teams(playoffs4_result, "playoffs2")
+  match_pairs3 <- list(
+    c('45', '46', 49),
+    c('47', '48', 50)
+  )
+  generate_match_data(match_pairs3, playoffs2, data, 49, "playoffs2_matches" )
+  playoffs2_matches[, c(7:11, 13)] <- scale(playoffs2_matches[, c(7:11, 13)])
+  playoffs2_matches$home <- factor(playoffs2_matches$home, levels = c("0", "1"))
+  playoffs2_matches$coachFromCountry <- factor(playoffs2_matches$coachFromCountry, levels = c("0", "1"))
+  predict_goals2 <- predict(my_forest, playoffs2_matches[,6:13])
+  playoffs2_matches$goals <- predict_goals2
+  playoffs2_result <-playoffs2_matches[,1:6]
+  playoffs2_result$goals_scored <- round(playoffs2_result$goals)
+  playoffs2_result$goalsDiff <- calculate_goals_diff(playoffs2_result, "goals")
+  playoffs2_result$goals2 <- playoffs2_result$goals * 1.33
+  playoffs2_result$diff_overtime <- calculate_goals_diff(playoffs2_result, "goals2")
+  select_teams(playoffs2_result, "final")
+  
+  match_pair4 <- list(c('49', '50', 51))
+  generate_match_data(match_pair4, final, data, 51, "final_match" )
+  final_match[, c(7:11, 13)] <- scale(final_match[, c(7:11, 13)])
+  final_match$home <- factor(final_match$home, levels = c("0", "1"))
+  final_match$coachFromCountry <- factor(final_match$coachFromCountry, levels = c("0", "1"))
+  predict_goals1 <- predict(my_forest, final_match[,6:13])
+  final_match$goals <- predict_goals1
+  final_match_result <-final_match[,1:5]
+  final_match_result$goals_scored <- round(final_match_result$goals)
+  final_match_result$goalsDiff <- calculate_goals_diff(final_match_result, "goals")
+  final_match_result$goals2 <- final_match_result$goals * 1.33
+  final_match_result$diff_overtime <- calculate_goals_diff(final_match_result, "goals2")
+  select_teams(final_match_result, "winner")
+
+  playoffs_counts <- count_occurrences(playoffs$team, playoffs_counts)
+  playoffs4_counts <- count_occurrences(playoffs4$team, playoffs4_counts)
+  playoffs2_counts <- count_occurrences(playoffs2$team, playoffs2_counts)
+  final_counts <- count_occurrences(final$team, final_counts)
+  winner_counts <- count_occurrences(winner$team, winner_counts)
+}
+```
+
+
+### Grupy
+
+Grupa A: <br>
+```{r}
+group_A_results
+group_A_summary
+```
+
+Grupa B: <br>
+```{r}
+group_B_results
+group_B_summary
+```
+
+Grupa C: <br>
+```{r}
+group_C_results
+group_C_summary
+```
+
+Grupa D: <br>
+```{r}
+group_D_results
+group_D_summary
+```
+
+Grupa E: <br>
+```{r}
+group_E_results
+group_E_summary
+```
+Grupa F:
+
+```{r}
+group_F_results
+group_F_summary
+```
+
+### 1/8 - jeden z wyników
+
+W playoffach najważniejsza jest różnica bramek strzelonych w meczu. Jeżeli jest równa to o awansie decysuje różnica bramek po dogrywce (początkowe bramki przemonożone przez 1.33). Następnie jeżeli dalej nie ma rozstrzygnięcia o awansie decyduja rzuty karne (rzut monetą).
+
+```{r}
+playoffs8_result
+```
+
+### 1/4 - jeden z wyników
+```{r}
+playoffs4_result
+```
+
+### 1/2 - jeden z wyników
+```{r}
+playoffs2_result
+```
+
+### Finał - jeden z wyników
+```{r}
+final_match_result
+```
+
+### Zwyciezca - jeden z wyników
+```{r}
+winner$team
+```
+
+### Podsumowanie - ile razy każda reprezentacja pojawiła się w danej fazie turnieju:
+Udziały w 1/8:
+```{r}
+  print(playoffs_counts)
+```
+Udizały w 1/4:
+```{r}
+  print(playoffs4_counts)
+```
+Udziały w 1/2
+```{r}
+  print(playoffs2_counts)
+```
+Udziały w finałach i zwyciezca
+```{r}
+  print(final_counts)
+  print(winner_counts)
+```
+Można zauważyć że w wynikach z modelu lasu losowego pojawiły się rzuty karne między Hiszpanią a Portugalią w półfinale, ale nie miało to wpływu na ostatecznego zwycięzce
+
+# 9. Wybór modelu sieci neuronowych
+
+Testowane parametry: <br>
+1. layer_values <br>
+Liczba neuronów w warstwie ukrytej modelu sieci neuronowej. <br>
+Wartości: c(4, 8, 16) <br>
+2. epochs_values <br>
+Liczba epok (przejść przez cały zbiór treningowy) podczas trenowania modelu. <br>
+Wartości: c(200, 500, `1000) <br>
+3. batch_size_values <br>
+Wielkość batcha, czyli liczba próbek przetwarzanych przed aktualizacją wag modelu. <br>
+Wartości: c(5, 10, 15) <br>
+Testowany model ma dwie warstwy ukryte oraz funkcje aktywacji relu.
+
+```{r}
+# Przygotowanie danych
+x_train <- as.matrix(sapply(data_training[, 7:14], as.numeric))
+y_train <- as.matrix(data_training$goals)
+x_test <- as.matrix(sapply(data_test[, 7:14], as.numeric))
+y_test <- as.matrix(data_test$goals)
+
+# Definicje wartości dla liczby warstw, epok i neuronów na warstwę
+layer_values <- c(1, 2, 3)
+epochs_values <- c(200, 500, 1000)
+neurons_values <- c(4, 8, 16)
+
+# Tworzenie siatki wyników
+results2 <- expand.grid(layers = layer_values, epochs = epochs_values, neurons = neurons_values)
+results2$train_mse <- NA
+results2$train_rsq <- NA
+results2$test_mse <- NA
+results2$test_rsq <- NA
+
+best_test_mse <- Inf
+best_model <- NULL
+
+for (i in 1:nrow(results2)) {
+  layers <- results2$layers[i]
+  epochs <- results2$epochs[i]
+  neurons <- results2$neurons[i]
+  
+  tryCatch({
+    model <- keras_model_sequential()
+    model %>% layer_dense(units = neurons, activation = 'relu', input_shape = c(ncol(x_train)))
+    
+    for (j in 1:layers) {
+      model %>% layer_dense(units = neurons, activation = 'relu')
+    }
+    
+    model %>% layer_dense(units = 1, activation = 'relu')
+    
+    model %>% compile(
+      loss = 'mean_squared_error',
+      optimizer = optimizer_adam()
+    )
+    
+    history <- model %>% fit(
+      x_train, y_train,
+      epochs = epochs,
+      validation_split = 0.2,
+      verbose = 0
+    )
+    
+    train_predictions <- model %>% predict(x_train)
+    train_mse <- mean((y_train - train_predictions)^2)
+    train_rsq <- 1 - (sum((y_train - train_predictions)^2) / sum((y_train - mean(y_train))^2))
+    
+    test_predictions <- model %>% predict(x_test)
+    test_mse <- mean((y_test - test_predictions)^2)
+    test_rsq <- 1 - (sum((y_test - test_predictions)^2) / sum((y_test - mean(y_test))^2))
+    
+    results2$train_mse[i] <- train_mse
+    results2$train_rsq[i] <- train_rsq
+    results2$test_mse[i] <- test_mse
+    results2$test_rsq[i] <- test_rsq
+    
+    if (test_mse < best_test_mse) {
+      best_test_mse <- test_mse
+      best_model <- model
+      best_params <- list(layers = layers, epochs = epochs, neurons = neurons)
+    }
+    
+  }, error = function(e) {
+    cat("Error in training model with layers =", layers, "epochs =", epochs, "neurons =", neurons, ":\n", e$message, "\n")
+  })
+}
+#save_model_hdf5(best_model, filepath = "best_model11.h5")
+results2
+#8 fajny wynik dal
+
+```
+Wykresy:
+```{r}
+# Wykres dla różnych liczby warstw
+ggplot(results2, aes(x = factor(layers), y = test_mse, color = factor(layers))) +
+  geom_boxplot() +
+  geom_point(aes(y = train_mse), position = position_jitter(width = 0.2), alpha = 0.6) +
+  labs(title = "Porównanie train_mse i test_mse dla różnych wartości warstw",
+       x = "Warstwy",
+       y = "MSE",
+       color = "Warstwy") +
+  theme_minimal()
+
+# Wykres porównujący liczby epok
+ggplot(results2, aes(x = factor(epochs), y = test_mse, color = factor(epochs))) +
+  geom_boxplot() +
+  geom_point(aes(y = train_mse), position = position_jitter(width = 0.2), alpha = 0.6) +
+  labs(title = "Porównanie train_mse i test_mse dla różnych wartości epok",
+       x = "Epoki",
+       y = "MSE",
+       color = "Epoki") +
+  theme_minimal()
+
+# Wykres porównujący liczby neuronów na warstwę
+ggplot(results2, aes(x = factor(neurons), y = test_mse, color = factor(neurons))) +
+  geom_boxplot() +
+  geom_point(aes(y = train_mse), position = position_jitter(width = 0.2), alpha = 0.6) +
+  labs(title = "Porównanie train_mse i test_mse dla różnych wartości neuronów",
+       x = "Neurons",
+       y = "MSE",
+       color = "Neurony") +
+  theme_minimal()
+```
+Modele z MSE na zbiorze testowym mnejszym od 0.2:
+```{r}
+selected_rows2 <- subset(results2, test_mse < 0.2)
+selected_rows
+```
+Wczytuje wczesniej wytrenowany model o takich parametrach:
+```{r}
+# Najlepszy model
+cat("Liczba warstw ukrytych:", best_params$layers, "\n")
+cat("Liczba epok:", best_params$epochs, "\n")
+cat("Liczba neuronów w warstwie:", best_params$neurons, "\n")
+cat("Najniższe test MSE:", best_test_mse, "\n")
+my_neural_network <- load_model_hdf5("best_model8.h5")
+summary(best_model)
+```
+MSE modelu na zbiorze testowym jest ponad dwa razy mniejsze od tego uzyskanego w modelu lasu losowego.
+
+# 10, SIECI NEURONOWE - wyniki
+```{r}
+playoffs_counts2 <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+playoffs4_counts2 <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+playoffs2_counts2 <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+final_counts2 <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+winner_counts2 <- data.frame(team = teams_list, count = rep(0, length(teams_list)))
+predict_goals2 <- my_neural_network %>% predict(as.matrix(sapply(data_predict[, 7:14], as.numeric)))
+data_predict$goals <- predict_goals2
+playoffs <- data.frame(matrix(ncol = 6, nrow = 0))
+colnames(playoffs) <- c("team", "total_points", "total_goalsDiff", "total_goalsScored", "ranking", "group_and_position")  
+  for (i in 1:n) {
+    for (group in groups) {
+      assign(paste0("group_", group, "_results_n"), data_predict[data_predict$phase == paste0("group", group), 2:6])
+      group_results <- get(paste0("group_", group, "_results_n"))
+      group_results$goals_scored <- round(group_results$goals)
+      group_results$goalsDiff <- calculate_goals_diff(group_results, "goals")
+      group_results$points <- ifelse(group_results$goalsDiff < 0, 0, 
+                                     ifelse(group_results$goalsDiff == 0, 1, 3))
+      assign(paste0("group_", group, "_results_n"), group_results)
+      group_summary <- aggregate(points ~ team, data = group_results, sum)
+      names(group_summary)[2] <- "total_points"
+      teams_same_points <- group_summary %>%
+        group_by(total_points) %>%
+        filter(n() > 1)
+      
+      if (all(teams_same_points$total_points == teams_same_points$total_points[1]) && nrow(teams_same_points) > 0) {
+        for (i in 1:(nrow(teams_same_points) - 1)) {
+          for (j in (i + 1):nrow(teams_same_points)) {
+            team1 <- teams_same_points$team[i]
+            team2 <- teams_same_points$team[j]
+            
+            direct_match <- group_results %>%
+              filter((team == team1 & opponent == team2) |
+                       (team == team2 & opponent == team1))
+            
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_points_", team1, "_vs_", team2) := 
+                       case_when(
+                         team == team1 ~ direct_match$points[1],
+                         team == team2 ~ direct_match$points[2],
+                         TRUE ~ NA_real_
+                       ))
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_goals_diff_", team1, "_vs_", team2) := 
+                       case_when(
+                         team == team1 ~ direct_match$goalsDiff[1],
+                         team == team2 ~ direct_match$goalsDiff[2],
+                         TRUE ~ NA_real_
+                       ))
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_goals_scored_", team1, "_vs_", team2) := 
+                       case_when(
+                         team == team1 ~ direct_match$goals_scored[1],
+                         team == team2 ~ direct_match$goals_scored[2],
+                         TRUE ~ NA_real_
+                       ))
+            
+          }
+        }
+        direct_match_points <- grep("^direct_match_points", names(group_summary), value = TRUE)
+        if (length(direct_match_points) > 1) {
+          group_summary$total_direct_matches_points <- rowSums(!is.na(group_summary[, direct_match_points]))
+        }
+        direct_match_goals_diff <- grep("^direct_match_goals_diff", names(group_summary), value = TRUE)
+        if (length(direct_match_goals_diff ) > 1) {
+          group_summary$total_direct_matches_goals_diff <- rowSums(!is.na(group_summary[, direct_match_goals_diff]))
+        }
+        direct_match_goals_scored <- grep("^direct_match_goals_scored", names(group_summary), value = TRUE)
+        if (length(direct_match_goals_scored) > 1) {
+          group_summary$total_direct_matches_goals_scored <- rowSums(!is.na(group_summary[, direct_match_goals_scored]))
+        }
+        
+      }else if(any(teams_same_points$total_points != teams_same_points$total_points[1]) && nrow(teams_same_points) > 0){
+        max_points_teams <- group_summary[group_summary$total_points == max(group_summary$total_points), "team"]
+        min_points_teams <- group_summary[group_summary$total_points == min(group_summary$total_points), "team"]
+        
+        for (i in 1:(length(max_points_teams) -1)) {
+          for (j in (i + 1):length(max_points_teams)) {
+            max_team1 <- max_points_teams[i]
+            max_team2 <- max_points_teams[j]
+            
+            direct_match <- group_results %>%
+              filter((team == max_team1 & opponent == max_team2) |
+                       (team == max_team2 & opponent == max_team1))
+            
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_points_", max_team1, "_vs_", max_team2) := 
+                       case_when(
+                         team == max_team1 ~ direct_match$points[1],
+                         team == max_team2 ~ direct_match$points[2],
+                         TRUE ~ NA_real_
+                       ))
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_goals_diff_", max_team1, "_vs_", max_team2) := 
+                       case_when(
+                         team == max_team1 ~ direct_match$goalsDiff[1],
+                         team == max_team2 ~ direct_match$goalsDiff[2],
+                         TRUE ~ NA_real_
+                       ))
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_goals_scored_", max_team1, "_vs_", max_team2) := 
+                       case_when(
+                         team == max_team1 ~ direct_match$goals_scored[1],
+                         team == max_team2 ~ direct_match$goals_scored[2],
+                         TRUE ~ NA_real_
+                       ))
+          }
+        }
+        for (i in 1:(length(min_points_teams) - 1)) {
+          for (j in (i + 1):length(min_points_teams)) {
+            min_team1 <- min_points_teams[i]
+            min_team2 <- min_points_teams[j]
+            
+            direct_match <- group_results %>%
+              filter((team == min_team1 & opponent == min_team2) |
+                       (team == min_team2 & opponent == min_team1))
+            
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_points_", min_team1, "_vs_", min_team2) := 
+                       case_when(
+                         team == min_team1 ~ direct_match$points[1],
+                         team == min_team2 ~ direct_match$points[2],
+                         TRUE ~ NA_real_
+                       ))
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_goals_diff_", min_team1, "_vs_", min_team2) := 
+                       case_when(
+                         team == min_team1 ~ direct_match$goalsDiff[1],
+                         team == min_team2 ~ direct_match$goalsDiff[2],
+                         TRUE ~ NA_real_
+                       ))
+            group_summary <- group_summary %>%
+              mutate(!!paste0("direct_match_goals_scored_", min_team1, "_vs_", min_team2) := 
+                       case_when(
+                         team == min_team1 ~ direct_match$goals_scored[1],
+                         team == min_team2 ~ direct_match$goals_scored[2],
+                         TRUE ~ NA_real_
+                       ))
+          }
+        }
+      }
+      sum_goalsDiff <- group_results %>%
+        group_by(team) %>%
+        summarise(total_goalsDiff = sum(goalsDiff, na.rm = TRUE))
+      
+      group_summary <- group_summary %>%
+        left_join(sum_goalsDiff, by = "team")
+      
+      sum_goalsScored <- group_results %>%
+        group_by(team) %>%
+        summarise(total_goalsScored = sum(goals_scored, na.rm = TRUE))
+      
+      group_summary <- group_summary %>%
+        left_join(sum_goalsScored, by = "team")
+      
+      group_summary <- left_join(group_summary, nations_league_rank, by = "team")
+      group_summary <- sort_group_summary(group_summary)
+      group_summary$group_and_position <- paste0(group, which(group_summary$team == group_summary$team), sep = "")
+      assign(paste0("group_", group, "_summary_n"), group_summary)
+      
+    }
+    
+    third_place_summary_n <- data.frame(team = character(), total_points = numeric(), stringsAsFactors = FALSE)
+    for (group in groups) {
+      third_place <- get(paste0("group_", group, "_summary_n"))[3, c("team", "total_points", "total_goalsDiff", "total_goalsScored", "ranking", "group_and_position")]
+      third_place_summary_n <- rbind(third_place_summary_n, third_place)
+    }
+    
+    third_place_summary_n<- arrange(third_place_summary_n, desc(total_points),desc(total_goalsDiff),desc(total_goalsScored),ranking)
+    
+    playoffs <- rbind(third_place_summary_n[1:4, ])
+    for (group in groups) {
+      group_summary <- get(paste0("group_", group, "_summary_n"))
+      playoffs <- rbind(playoffs, group_summary[1:2, c("team", "total_points", "total_goalsDiff", "total_goalsScored", "ranking", "group_and_position")])
+    }
+    
+    playoffs8_n <- data.frame()
+    result <- playoffs_rules[apply(playoffs_rules[, 1:4], 1, check_values), ]
+    
+    match_pairs <- list(
+      c("A1", "C2", 37),
+      c("A2", "B2", 38),
+      c(colnames(result)[5], result$B1,39),
+      c(colnames(result)[6], result$C1,40),
+      c(colnames(result)[8], result$F1,41),
+      c("D2", "E2", 42),
+      c(colnames(result)[7], result$E1,43),
+      c("D1", "F2", 44)
+    )
+    
+    generate_match_data(match_pairs, playoffs, data, 37, df_name = "playoffs8_n")
+    playoffs8_n[, c(7:11, 13)] <- scale(playoffs8_n[, c(7:11, 13)])
+    predict_goals_1_8_n <- my_neural_network %>% predict(as.matrix(sapply(playoffs8_n[, 6:13], as.numeric)))
+    playoffs8_n$goals <- predict_goals_1_8_n
+    playoffs8_result_n <-playoffs8_n[,1:6]
+    playoffs8_result_n$goals_scored <- round(playoffs8_result_n$goals)
+    playoffs8_result_n$goalsDiff <- calculate_goals_diff(playoffs8_result_n, "goals")
+    playoffs8_result_n$goals2 <- playoffs8_result_n$goals * 1.33
+    playoffs8_result_n$diff_overtime <- calculate_goals_diff(playoffs8_result_n, "goals2")
+    
+    
+    select_teams(playoffs8_result_n, "playoffs4_n")
+    match_pairs2 <- list(
+      c('39', '37', 45),
+      c('41', '42', 46),
+      c('40', '38', 47),
+      c('43', '44', 48)
+    )
+    generate_match_data(match_pairs2, playoffs4_n, data, 45, "playoffs4_matches_n" )
+    playoffs4_matches_n[, c(7:11, 13)] <- scale(playoffs4_matches_n[, c(7:11, 13)])
+    predict_goals4_n <- my_neural_network %>% predict(as.matrix(sapply(playoffs4_matches_n[,6:13], as.numeric)))
+    playoffs4_matches_n$goals <- predict_goals4_n
+    
+    
+    playoffs4_result_n <-playoffs4_matches_n[,1:6]
+    playoffs4_result_n$goals_scored <- round(playoffs4_result_n$goals)
+    playoffs4_result_n$goalsDiff <- calculate_goals_diff(playoffs4_result_n, "goals")
+    playoffs4_result_n$goals2 <- playoffs4_result_n$goals * 1.33
+    playoffs4_result_n$diff_overtime <- calculate_goals_diff(playoffs4_result_n, "goals2")
+    select_teams(playoffs4_result_n, "playoffs2_n")
+    match_pairs3 <- list(
+      c('45', '46', 49),
+      c('47', '48', 50)
+    )
+    generate_match_data(match_pairs3, playoffs2_n, data, 49, "playoffs2_matches_n" )
+    playoffs2_matches_n[, c(7:11, 13)] <- scale(playoffs2_matches_n[, c(7:11, 13)])
+    predict_goals2_n <- my_neural_network %>% predict(as.matrix(sapply(playoffs2_matches_n[,6:13], as.numeric)))
+    playoffs2_matches_n$goals <- predict_goals2_n
+    playoffs2_result_n <-playoffs2_matches_n[,1:6]
+    playoffs2_result_n$goals_scored <- round(playoffs2_result_n$goals)
+    playoffs2_result_n$goalsDiff <- calculate_goals_diff(playoffs2_result_n, "goals")
+    playoffs2_result_n$goals2 <- playoffs2_result_n$goals * 1.33
+    playoffs2_result_n$diff_overtime <- calculate_goals_diff(playoffs2_result_n, "goals2")
+    select_teams(playoffs2_result_n, "final_n")
+    
+    match_pair4 <- list(c('49', '50', 51))
+    generate_match_data(match_pair4, final_n, data, 51, "final_match_n" )
+    final_match_n[, c(7:11, 13)] <- scale(final_match_n[, c(7:11, 13)])
+    predict_goals1 <- my_neural_network %>% predict(as.matrix(sapply(final_match_n[, 6:13], as.numeric)))
+    final_match_n$goals <- predict_goals1
+    final_match_result_n <-final_match_n[,1:5]
+    final_match_result_n$goals_scored <- round(final_match_result_n$goals)
+    final_match_result_n$goalsDiff <- calculate_goals_diff(final_match_result_n, "goals")
+    final_match_result_n$goals2 <- final_match_result_n$goals * 1.33
+    final_match_result_n$diff_overtime <- calculate_goals_diff(final_match_result_n, "goals2")
+    select_teams(final_match_result_n, "winner_n")
+    
+    playoffs_counts2 <- count_occurrences(playoffs$team, playoffs_counts2)
+    playoffs4_counts2 <- count_occurrences(playoffs4_n$team, playoffs4_counts2)
+    playoffs2_counts2 <- count_occurrences(playoffs2_n$team, playoffs2_counts2)
+    final_counts2 <- count_occurrences(final_n$team, final_counts2)
+    winner_counts2 <- count_occurrences(winner_n$team, winner_counts2)
+  }
+```
+
+### Grupy
+
+Grupa A: <br>
+```{r}
+group_A_results_n
+group_A_summary_n
+```
+
+Grupa B: <br>
+```{r}
+group_B_results_n
+group_B_summary_n
+```
+
+Grupa C: <br>
+```{r}
+group_C_results_n
+group_C_summary_n
+```
+
+Grupa D: <br>
+```{r}
+group_D_results_n
+group_D_summary_n
+```
+
+Grupa E: <br>
+```{r}
+group_E_results_n
+group_E_summary_n
+```
+Grupa F:
+
+```{r}
+group_F_results_n
+group_F_summary_n
+```
+
+### 1/8 - jeden z wyników
+
+W playoffach najważniejsza jest różnica bramek strzelonych w meczu. Jeżeli jest równa to o awansie decysuje różnica bramek po dogrywce (początkowe bramki przemonożone przez 1.33). Następnie jeżeli dalej nie ma rozstrzygnięcia o awansie decyduja rzuty karne (rzut monetą).
+```{r}
+playoffs8_result_n
+```
+### 1/4 - jeden z wyników
+```{r}
+playoffs4_result_n
+playoffs4_result
+```
+
+### 1/2 - jeden z wyników
+```{r}
+playoffs2_result_n
+```
+
+### Finał - jeden z wyników
+```{r}
+final_match_result_n
+```
+
+### Zwyciezca - jeden z wyników
+```{r}
+winner$team_n
+```
+
+### Podsumowanie - ile razy każda reprezentacja pojawiła się w danej fazie turnieju:
+Udziały w 1/8:
+```{r}
+  print(playoffs_counts2)
+```
+
+Udizały w 1/4:
+```{r}
+  print(playoffs4_counts2)
+```
+Udziały w 1/2
+```{r}
+  print(playoffs2_counts2)
+```
+Udziały w finałach i zwyciezca
+```{r}
+  print(final_counts2)
+  print(winner_counts2)
+```
+Zwycięzca jest ten sam, natomiast można zauważyć, że inne drużyny które przeszły do playoffów trochę się rożnią oraz w playoffach jest więcej spotkań zakonczonych remisem co wpływa na różnorodność całego turnieju.
+```{r}
+colnames(data) <- c("team","home", "rank", "avg_value", "gdp", "avg_age", "players_abroad", "coach_country", "top_10_clubs")
+data <- data %>% 
+  select(c("team","home", "rank", "avg_value", "gdp", "avg_age", "players_abroad", "coach_country", "top_10_clubs"))
+```
+### Przykładowe drzewo decyzyjne
+```{r}
+library(rpart)
+library(rpart.plot)
+
+
+# Budowanie modelu drzewa regresji
+tree <- rpart(data_training$goals~ ., data = data_training[,7:14], method = "anova", maxdepth= 2, minsplit = 20)
+
+# Wizualizacja drzewa
+rpart.plot(tree)
+
+```
